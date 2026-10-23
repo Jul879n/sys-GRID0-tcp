@@ -1,6 +1,6 @@
 #!/bin/sh
 # Arma el paquete para la SD de la consola (sin logs de depuración) y crea el release privado en GitHub.
-# Uso: tools/release.sh <tag> [ruta-ovl]   Requiere: make ya ejecutado, gh autenticado.
+# Uso: [RELEASE_REPO=usuario/repo] tools/release.sh <tag> [ruta-ovl]   Requiere: make ya ejecutado, gh autenticado.
 set -eu
 TAG="${1:?uso: tools/release.sh <tag> [ruta-ovl]}"
 OVL="${2:-$HOME/Documents/zerotier-nx/zerotier-nx.ovl}"
@@ -32,5 +32,6 @@ ZIP="$ROOT/dist/zerotier-switch-$TAG.zip"
 rm -f "$ZIP"
 ( cd "$OUT" && zip -qr "$ZIP" . )
 shasum -a 256 "$ZIP"
-gh release create "$TAG" "$ZIP" --repo "$(git -C "$ROOT" remote get-url origin | sed 's#.*github.com[/:]##; s#\.git$##')" \
+REPO="${RELEASE_REPO:-$(git -C "$ROOT" remote get-url origin | sed 's#.*github.com[/:]##; s#\.git$##')}"
+gh release create "$TAG" "$ZIP" --repo "$REPO" \
     --target main --title "ZeroTier para Switch $TAG" --notes "Paquete para copiar a la raíz de la SD (Atmosphère + Ultrahand). Sin logs de depuración (debug_logging = 0). Pasos y reversión en LEEME.md."
