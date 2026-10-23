@@ -33,4 +33,4 @@ rm -f "$ZIP"
 ( cd "$OUT" && zip -qr "$ZIP" . )
 shasum -a 256 "$ZIP"
 gh release create "$TAG" "$ZIP" --repo "$(git -C "$ROOT" remote get-url origin | sed 's#.*github.com[/:]##; s#\.git$##')" \
-    --title "ZeroTier para Switch $TAG" --notes "Paquete para copiar a la raíz de la SD (Atmosphère + Ultrahand). Sin logs de depuración (debug_logging = 0). Pasos y reversión en LEEME.md."
+    --target main --title "ZeroTier para Switch $TAG" --notes "Paquete para copiar a la raíz de la SD (Atmosphère + Ultrahand). Sin logs de depuración (debug_logging = 0). Pasos y reversión en LEEME.md."
