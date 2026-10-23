@@ -41,9 +41,12 @@ namespace ztnx::net {
     typedef void (*EmitFn)(void *ctx, u64 dstMac, u16 etherType,
                            const void *payload, unsigned int len);
 
+    /* TCP no vive en VNet: quien lo implementa (TcpStack) se engancha aquí. */
+    typedef void (*TcpInputFn)(void *ctx, u32 srcIp, u32 dstIp, const u8 *segment, unsigned int len);
+
     struct Stats {
-        u32 rxFrames, rxIp, rxUdp, rxArp, rxIcmp;
-        u32 txFrames, txUdp, txArp, txIcmp;
+        u32 rxFrames, rxIp, rxUdp, rxArp, rxIcmp, rxTcp;
+        u32 txFrames, txUdp, txArp, txIcmp, txTcp;
         u32 dropNotForUs, dropBadChecksum, dropNoSocket, dropNoBuffer,
             dropTooBig, dropMalformed, dropReasm;
         u32 lastNoSocketSrcIp;
@@ -58,6 +61,10 @@ namespace ztnx::net {
          * controller has assigned an address. */
         void configure(u64 mac, u32 ip, u32 netmask, u16 mtu);
         void setEmit(EmitFn fn, void *ctx) { m_emit = fn; m_emitCtx = ctx; }
+        void setTcpInput(TcpInputFn fn, void *ctx) { m_tcpFn = fn; m_tcpCtx = ctx; }
+
+        /* Envía un paquete IPv4 ya armado por capas superiores (TCP). */
+        void sendIp(u32 dstIp, u8 proto, const u8 *payload, unsigned int len);
 
         bool configured() const { return m_configured; }
         u64  localMac()   const { return m_mac; }
@@ -150,6 +157,8 @@ namespace ztnx::net {
                           const u8 *data, unsigned int len);
         EmitFn m_emit = nullptr;
         void  *m_emitCtx = nullptr;
+        TcpInputFn m_tcpFn = nullptr;
+        void      *m_tcpCtx = nullptr;
 
         bool m_configured = false;
         u64  m_mac = 0;

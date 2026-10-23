@@ -161,6 +161,9 @@ AMS_SF_DEFINE_MITM_INTERFACE(ztnx::mitm, IBsdShim, AMS_ZTNX_I_BSD_INTERFACE_INFO
 
 namespace ztnx::mitm {
 
+    /* Lee extra_titles y mitm_homebrew de config.ini (una vez, al arrancar). */
+    void LoadMitmPolicy();
+
     class BsdShim {
         private:
             std::shared_ptr<::Service> m_forward_service;

@@ -414,7 +414,14 @@ namespace ams {
          * for eight unused 4 KB pointer buffers and session metadata. */
         constexpr size_t MitmSessions  = 24;
         constexpr int    PortIndex_Bsd = 0;
-        constexpr int    PortIndex_Count = 1;
+        /* bsd:s: libnx con BsdServiceType_Auto (Sphaira, homebrew en general) prueba
+         * bsd:s ANTES que bsd:u (bsd.c:_bsdInitialize), así que un homebrew nunca
+         * pasaría por el MITM de bsd:u. Misma BsdShim y misma ShouldMitm: los módulos
+         * de sistema (id < FirstInterceptableId) y sys-GRID0 mismo (SelfProgramId, que
+         * usa bsd:s con BsdServiceType_System) no se interceptan, por lo que no hay
+         * bucle. Las sesiones (MitmSessions) se reparten entre ambos puertos. */
+        constexpr int    PortIndex_BsdS = 1;
+        constexpr int    PortIndex_Count = 2;
 
         /* DefaultServerManagerOptions sets CanManageMitmServers = false, and
          * RegisterMitmServer asserts on it. Same shape ams_mitm uses. */
@@ -481,6 +488,7 @@ namespace ams {
 
                     switch (port_index) {
                         case PortIndex_Bsd:
+                        case PortIndex_BsdS:
                             R_RETURN(this->AcceptMitmImpl(
                                 server,
                                 sf::CreateSharedObjectEmplaced<ztnx::mitm::IBsdShim, ztnx::mitm::BsdShim>(decltype(fsrv)(fsrv), client_info),
@@ -573,6 +581,7 @@ namespace ams {
                 return;
             }
 
+            ztnx::mitm::LoadMitmPolicy();
             g_mitm_manager = ams::util::ConstructAt(g_mitm_manager_storage);
 
             /* The template argument is the IMPL, not the interface --
@@ -585,6 +594,20 @@ namespace ams {
                 return;
             }
 
+            /* Por defecto apagado: sm consulta ShouldMitm por cada proceso de sistema
+             * que abre bsd:s, y no está medido en hardware que la sesión de reenvío
+             * tenga el mismo pointer buffer que bsd:u (OnNeedsToAccept lo registra). */
+            if (ztnx::ConfigFlag("bsd_s_mitm", false)) {
+                const ams::Result rs = g_mitm_manager->RegisterMitmServer<ztnx::mitm::BsdShim>(
+                                           PortIndex_BsdS, ams::sm::ServiceName::Encode("bsd:s"));
+                if (R_FAILED(rs)) {
+                    ztnx::Trace("mitm: RegisterMitmServer(bsd:s) failed 0x%x", rs.GetValue());
+                } else {
+                    ztnx::Trace("mitm: bsd:s registered, relaying");
+                }
+            } else {
+                ztnx::Trace("mitm: bsd:s DISABLED by config (bsd_s_mitm = 0)");
+            }
             if (R_FAILED(os::CreateThread(std::addressof(g_mitm_thread), MitmThreadMain, nullptr,
                                           g_mitm_thread_stack, sizeof(g_mitm_thread_stack),
                                           os::DefaultThreadPriority))) {
@@ -593,6 +616,7 @@ namespace ams {
             }
             os::StartThread(std::addressof(g_mitm_thread));
             ztnx::Trace("mitm: bsd:u registered, relaying");
+
             StartNifmMitm();
         }
 

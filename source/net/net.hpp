@@ -84,6 +84,7 @@ namespace ztnx::net {
     /* ---- IPv4 -------------------------------------------------------- */
 
     constexpr u8 IpProto_ICMP = 1;
+    constexpr u8 IpProto_TCP  = 6;
     constexpr u8 IpProto_UDP  = 17;
 
     constexpr u32 IpBroadcast = 0xFFFFFFFFu;   /* host order */

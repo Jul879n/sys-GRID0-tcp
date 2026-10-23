@@ -11,6 +11,8 @@
  */
 #include "bsd_shim.hpp"
 #include "lan_titles.hpp"
+#include "mitm_policy.hpp"
+#include "tcp_sockets.hpp"
 #include "../zt_port.hpp"
 #include "../net/lifetime.hpp"
 
@@ -434,6 +436,10 @@ namespace ztnx::mitm {
          * local to VNet. Keep both values in this fixed table: MITM handlers
          * can arrive on any one of a game's bsd:u sessions, so session-local
          * state would be intermittently wrong. */
+        /* Qué procesos se interceptan; se carga una vez al arrancar desde
+         * config.ini (extra_titles, mitm_homebrew). Cambiarlas exige reiniciar. */
+        Policy g_policy;
+
         constexpr int MaxLanSockets = 8;
         struct LanSocket {
             u64 pid;
@@ -452,6 +458,93 @@ namespace ztnx::mitm {
         ztnx::Port *g_port = nullptr;
         u32 g_physicalIp = 0;
         u32 g_physicalMask = 0;
+
+        /* ---- TCP virtual (lwIP) -----------------------------------------
+         * g_tcpsocks vive detrás del lock de Port: todo acceso pasa por
+         * Port::WithTcp (el mismo que serializa VNet y lwIP). Los fds que ve la
+         * app son siempre fds reales de bsd (marcadores); aquí solo se decide
+         * cuáles atiende lwIP. */
+        TcpSockets g_tcpsocks;
+
+        template <typename R, typename F>
+        R TcpDo(R fallback, F &&f) {
+            if (g_port == nullptr) { return fallback; }
+            return g_port->WithTcp(std::forward<F>(f));
+        }
+
+        /* 1 ms (antes 5): cada espera de más se suma al RTT efectivo de la ventana TCP. */
+        void TcpSleep() { ams::os::SleepThread(ams::TimeSpan::FromMilliSeconds(1)); }
+        u64  TcpNowMs() { return armGetSystemTick() / 19200; }
+
+        constexpr u32 MsgPeekFlag = 0x2;
+        constexpr u32 MsgDontWaitFlags = 0x40 | 0x80;   /* Linux | BSD; sin verificar en bsd:u */
+
+        void WriteSockAddr(u8 *sa, u32 ip, u16 port) {
+            std::memset(sa, 0, 16);
+            sa[0] = 16; sa[1] = 2;
+            sa[2] = static_cast<u8>(port >> 8); sa[3] = static_cast<u8>(port);
+            sa[4] = static_cast<u8>(ip >> 24); sa[5] = static_cast<u8>(ip >> 16);
+            sa[6] = static_cast<u8>(ip >> 8);  sa[7] = static_cast<u8>(ip);
+        }
+
+        TcpSockets::Info TcpGetInfo(u64 pid, s32 fd) {
+            return TcpDo(TcpSockets::Info{}, [&](net::TcpStack &) { return g_tcpsocks.get(pid, fd); });
+        }
+
+        /* Sondeo no bloqueante del fd real (POLLIN). */
+        bool RealReadable(::Service *svc, u64 pid, s32 fd) {
+            struct PollFd { s32 fd; s16 events; s16 revents; } __attribute__((packed));
+            PollFd in_p{ fd, 1, 0 }, out_p{ fd, 0, 0 };
+            const struct { s32 nfds, timeout; } in = { 1, 0 };
+            BsdResult out{};
+            if (R_FAILED(serviceMitmDispatchInOut(svc, 6, in, out,
+                   .buffer_attrs = { SfBufferAttr_HipcAutoSelect | SfBufferAttr_In,
+                                     SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out },
+                   .buffers      = { { std::addressof(in_p),  sizeof(in_p)  },
+                                     { std::addressof(out_p), sizeof(out_p) } },
+                   .override_pid = pid))) { return false; }
+            return out.ret > 0 && (out_p.revents & 1) != 0;
+        }
+
+        /* recv sobre una conexión virtual. Devuelve true si el fd es virtual. */
+        bool TcpVirtualRecv(u64 pid, s32 fd, void *buf, size_t size, u32 flags,
+                            s32 *ret, s32 *err) {
+            const TcpSockets::Info ts = TcpGetInfo(pid, fd);
+            if (ts.kind != TcpSockets::Kind::Conn) { return false; }
+            const bool peek = (flags & MsgPeekFlag) != 0;
+            const bool dontwait = (flags & MsgDontWaitFlags) != 0;
+            for (;;) {
+                const int n = TcpDo(-ErrBadF, [&](net::TcpStack &t) {
+                    return g_tcpsocks.recv(t, pid, fd, buf, static_cast<unsigned int>(size), peek); });
+                if (n >= 0) { *ret = n; *err = 0; return true; }
+                if (n != -ErrAgain) { *ret = -1; *err = -n; return true; }
+                if (ts.nonblock || dontwait) { *ret = -1; *err = ErrAgain; return true; }
+                if (TcpGetInfo(pid, fd).kind != TcpSockets::Kind::Conn) { *ret = -1; *err = ErrBadF; return true; }
+                TcpSleep();
+            }
+        }
+
+        /* send sobre una conexión virtual: bloqueante envía todo; no bloqueante, lo que quepa. */
+        bool TcpVirtualSend(u64 pid, s32 fd, const void *buf, size_t size, u32 flags,
+                            s32 *ret, s32 *err) {
+            const TcpSockets::Info ts = TcpGetInfo(pid, fd);
+            if (ts.kind != TcpSockets::Kind::Conn) { return false; }
+            const bool dontwait = (flags & MsgDontWaitFlags) != 0;
+            const u8 *p = static_cast<const u8 *>(buf);
+            size_t sent = 0;
+            while (sent < size) {
+                const int n = TcpDo(-ErrBadF, [&](net::TcpStack &t) {
+                    return g_tcpsocks.send(t, pid, fd, p + sent, static_cast<unsigned int>(size - sent)); });
+                if (n > 0) { sent += static_cast<size_t>(n); continue; }
+                if (n != -ErrAgain) { *ret = sent > 0 ? static_cast<s32>(sent) : -1; *err = sent > 0 ? 0 : -n; return true; }
+                if (ts.nonblock || dontwait) { break; }
+                if (TcpGetInfo(pid, fd).kind != TcpSockets::Kind::Conn) { break; }
+                TcpSleep();
+            }
+            if (sent > 0) { *ret = static_cast<s32>(sent); *err = 0; }
+            else { *ret = -1; *err = size == 0 ? 0 : ErrAgain; if (size == 0) { *ret = 0; } }
+            return true;
+        }
 
         /* Splatoon 2 tears down and recreates nn::socket environments quickly.
          * Forwarding the game's TransferMemory handle gives real bsd a copy
@@ -612,6 +705,7 @@ namespace ztnx::mitm {
             }
             if (g_port != nullptr) {
                 for (int i = 0; i < count; ++i) { g_port->CloseLanSocket(vfds[i]); }
+                TcpDo(0, [&](net::TcpStack &t) { g_tcpsocks.forgetPid(t, pid); return 0; });
             }
             {
                 std::scoped_lock lk(g_browse_observation_lock);
@@ -1303,6 +1397,18 @@ namespace ztnx::mitm {
                  m_proxy_registration ? "bsd/proxy" : "bsd/tmem");
     }
 
+    void LoadMitmPolicy() {
+        Policy pol;
+        char list[160];
+        if (ztnx::ConfigString("extra_titles", list, sizeof(list))) {
+            pol.nExtra = ParseTitleList(list, pol.extra, MaxExtraTitles);
+        }
+        pol.homebrew = ztnx::ConfigFlag("mitm_homebrew", false);
+        g_policy = pol;
+        NoteSync("policy          extra_titles %u  mitm_homebrew %d",
+                 static_cast<unsigned>(pol.nExtra), pol.homebrew ? 1 : 0);
+    }
+
     bool BsdShim::ShouldMitm(const ams::sm::MitmProcessInfo &client) {
         /* Counted, because the gap between this and OnNeedsToAccept is the one
          * remaining place the failure can hide.
@@ -1331,8 +1437,24 @@ namespace ztnx::mitm {
          * process reach bsd through this same service name and would be handed
          * to us. Intercepting those does not break a game, it breaks the
          * console's networking. */
-        if (!ams::ncm::IsApplicationId(client.program_id) ||
-            FindLanTitle(client.program_id.value) == nullptr) {
+        if (!ShouldIntercept(client.program_id.value,
+                             ams::ncm::IsApplicationId(client.program_id),
+                             FindLanTitle(client.program_id.value) != nullptr,
+                             g_policy)) {
+            /* Para descubrir el program id de un homebrew: con debug_logging = 1,
+             * abrirlo y buscar esta línea en bsd.log. Una línea por program id (máx. 64), para no llenar
+             * el anillo con los procesos de sistema que preguntan todo el tiempo. */
+            static u64 s_seen[64] = {};
+            static int s_denied = 0;
+            if (client.program_id.value >= FirstInterceptableId && s_denied < 64) {
+                bool known = false;
+                for (int i = 0; i < s_denied; ++i) { known |= s_seen[i] == client.program_id.value; }
+                if (!known) {
+                    s_seen[s_denied++] = client.program_id.value;
+                    NoteSync("ShouldMitm      program %016llx -> no (fuera de la política)",
+                             (unsigned long long)client.program_id.value);
+                }
+            }
             return false;
         }
 
@@ -1356,7 +1478,7 @@ namespace ztnx::mitm {
          * first bsd:u session a game opens never receives RegisterClient, and
          * intercepting it destabilises the system. Let it go straight to the
          * real service. */
-        if (n == 1) {
+        if (IsDummySession(n, FindLanTitle(client.program_id.value) != nullptr)) {
             NoteSync("ShouldMitm      ask #%d  pid %llu -> no (dummy session #1)",
                      ++s_asks, (unsigned long long)client.process_id.value);
             return false;
@@ -1638,6 +1760,13 @@ namespace ztnx::mitm {
             }
             if (!tracked) { Note("LAN table       full; fd %d untracked", out.ret); }
         }
+        if (out.ret >= 0 && domain == 2 && type == 1 && (protocol == 0 || protocol == 6)) {
+            const u64 pid = m_client_info.process_id.value;
+            const s32 fd = out.ret;
+            if (!TcpDo(true, [&](net::TcpStack &) { return g_tcpsocks.track(pid, fd); })) {
+                Note("TCP table       full; fd %d untracked", fd);
+            }
+        }
         /* AF_INET = 2, SOCK_DGRAM = 2. Everything this project cares about is
          * that pair; anything else is noted once so we know it existed. */
         Note("Socket          domain %d type %d proto %d -> fd %d", domain, type, protocol, out.ret);
@@ -1656,8 +1785,30 @@ namespace ztnx::mitm {
     Result BsdShim::Bind(ams::sf::Out<s32> ret, ams::sf::Out<s32> err, s32 sockfd,
                          const ams::sf::InAutoSelectBuffer &addr) {
         BsdResult out;
+        /* La IP ZeroTier no es una interfaz real: un bind real a ella falla con
+         * EADDRNOTAVAIL. ftpsrv (Sphaira) hace bind del socket PASV a la IP de
+         * getsockname() del control, que por la VPN es la ZeroTier. Si el socket
+         * es TCP rastreado y la IP es la ZeroTier, el bind real va a 0.0.0.0 y
+         * la IP ZeroTier se guarda aparte (onBind) para abrir el listener lwIP. */
+        u8 anyAddr[32] = {};
+        const void *fwdPtr = addr.GetPointer();
+        size_t fwdSize = addr.GetSize();
+        if (addr.GetSize() >= 8 && addr.GetSize() <= sizeof(anyAddr) && g_port != nullptr &&
+            static_cast<const u8 *>(addr.GetPointer())[1] == 2) {
+            u32 ztIp = 0;
+            const u8 *p0 = static_cast<const u8 *>(addr.GetPointer());
+            if (ReadBe32(p0 + 4) != 0 && g_port->GetLanIpConfig(std::addressof(ztIp), nullptr) &&
+                ReadBe32(p0 + 4) == ztIp &&
+                TcpGetInfo(m_client_info.process_id.value, sockfd).kind == TcpSockets::Kind::Plain) {
+                std::memcpy(anyAddr, addr.GetPointer(), addr.GetSize());
+                anyAddr[4] = anyAddr[5] = anyAddr[6] = anyAddr[7] = 0;
+                fwdPtr = anyAddr;
+                Note("Bind            fd %d  IP ZeroTier -> bind real a 0.0.0.0", sockfd);
+            }
+        }
         R_TRY(serviceMitmDispatchInOut(m_forward_service.get(), 13, sockfd, out,
-                                       ZTNX_IN_BUF(addr), ZTNX_PID));
+                                       .buffer_attrs = { SfBufferAttr_HipcAutoSelect | SfBufferAttr_In },
+                                       .buffers      = { { fwdPtr, fwdSize } }, ZTNX_PID));
         ZTNX_RET(out);
         /* Bind is where a known Pia LAN fd receives a VNet shadow socket; the
          * real bind is still forwarded. Do not require SO_BROADCAST here:
@@ -1667,6 +1818,11 @@ namespace ztnx::mitm {
         if (out.ret == 0 && addr.GetSize() >= 8 && g_port != nullptr) {
             const u8 *p = static_cast<const u8 *>(addr.GetPointer());
             const u16 port = (u16)((p[2] << 8) | p[3]);
+            {
+                const u32 bind_ip = ReadBe32(p + 4);
+                const u64 pid = m_client_info.process_id.value;
+                TcpDo(0, [&](net::TcpStack &) { g_tcpsocks.onBind(pid, sockfd, bind_ip, port); return 0; });
+            }
             bool should_mirror = false;
             {
                 std::scoped_lock lk(g_lan_sockets_lock);
@@ -1734,6 +1890,12 @@ namespace ztnx::mitm {
          * can return an asynchronous ICMP error on the next RecvFrom; Pia
          * treats that unrelated error as a dead LAN session and closes every
          * socket. A disabled MITM remains the local-LAN compatibility path. */
+        {
+            s32 r = 0, e = 0;
+            if (TcpVirtualSend(m_client_info.process_id.value, sockfd, buf.GetPointer(), buf.GetSize(), flags, &r, &e)) {
+                ret.SetValue(r); err.SetValue(e); R_SUCCEED();
+            }
+        }
         bool overlay_sent = false;
         if (addr.GetSize() >= 8 && g_port != nullptr) {
             const u8 *p = static_cast<const u8 *>(addr.GetPointer());
@@ -1809,6 +1971,19 @@ namespace ztnx::mitm {
         BsdResult out;
         R_TRY(serviceMitmDispatchInOut(m_forward_service.get(), 18, in, out, ZTNX_PID));
         ZTNX_RET(out);
+        if (out.ret == 0 && g_port != nullptr) {
+            u32 zt_ip = 0;
+            if (g_port->GetLanIpConfig(std::addressof(zt_ip), nullptr)) {
+                const u64 pid = m_client_info.process_id.value;
+                const bool zt = TcpDo(false, [&](net::TcpStack &t) { return g_tcpsocks.onListen(t, pid, sockfd, zt_ip); });
+                Note("Listen          fd %d backlog %d zt_ip %08x -> lwIP %s", sockfd, backlog,
+                     static_cast<unsigned>(zt_ip), zt ? "listener" : "NO (sin listener lwIP: socket no rastreado, IP real o sin cupo)");
+            } else {
+                Note("Listen          fd %d backlog %d -> sin IP ZeroTier", sockfd, backlog);
+            }
+        } else {
+            Note("Listen          fd %d backlog %d -> real %d", sockfd, backlog, out.ret);
+        }
         R_SUCCEED();
     }
 
@@ -1817,10 +1992,24 @@ namespace ztnx::mitm {
         BsdResult out;
         R_TRY(serviceMitmDispatchInOut(m_forward_service.get(), 20, in, out, ZTNX_PID));
         ZTNX_RET(out);
+        if (out.ret >= 0 && cmd == 4) {   /* F_SETFL: O_NONBLOCK = 0x4 (BSD) o 0x800 (Linux); sin verificar */
+            const u64 pid = m_client_info.process_id.value;
+            const bool nb = (arg & 0x804) != 0;
+            TcpDo(0, [&](net::TcpStack &) { g_tcpsocks.setNonblock(pid, fd, nb); return 0; });
+        }
         R_SUCCEED();
     }
 
     Result BsdShim::Shutdown(ams::sf::Out<s32> ret, ams::sf::Out<s32> err, s32 sockfd, s32 how) {
+        {
+            const u64 pid = m_client_info.process_id.value;
+            if (TcpGetInfo(pid, sockfd).kind == TcpSockets::Kind::Conn) {
+                TcpDo(0, [&](net::TcpStack &t) { g_tcpsocks.shutdown(t, pid, sockfd, how); return 0; });
+                ret.SetValue(0);
+                err.SetValue(0);
+                R_SUCCEED();
+            }
+        }
         const struct { s32 fd, how; } in = { sockfd, how };
         BsdResult out;
         R_TRY(serviceMitmDispatchInOut(m_forward_service.get(), 22, in, out, ZTNX_PID));
@@ -1857,7 +2046,11 @@ namespace ztnx::mitm {
         BsdResult out;
         R_TRY(serviceMitmDispatchInOut(m_forward_service.get(), 26, fd, out, ZTNX_PID));
         ZTNX_RET(out);
-        if (out.ret == 0) { ForgetLanSocket(m_client_info.process_id.value, fd); }
+        if (out.ret == 0) {
+            const u64 pid = m_client_info.process_id.value;
+            ForgetLanSocket(pid, fd);
+            TcpDo(0, [&](net::TcpStack &t) { g_tcpsocks.forget(t, pid, fd); return 0; });
+        }
         R_SUCCEED();
     }
 
@@ -1879,6 +2072,28 @@ namespace ztnx::mitm {
          * before sending the three browse replies. Asking physical Wi-Fi to
          * connect to the managed address can fail before Send ever reaches
          * the mirror, making Switch-hosted rooms invisible. */
+        if (addr.GetSize() >= 8 && static_cast<const u8 *>(addr.GetPointer())[1] == 2) {
+            const u8 *p = static_cast<const u8 *>(addr.GetPointer());
+            const u64 pid = m_client_info.process_id.value;
+            const TcpSockets::Info ts = TcpGetInfo(pid, sockfd);
+            const u32 ip = ReadBe32(p + 4);
+            const u16 port = static_cast<u16>((p[2] << 8) | p[3]);
+            bool broadcast = false;
+            if (ts.kind == TcpSockets::Kind::Plain && IsOverlayDestination(ip, std::addressof(broadcast)) && !broadcast) {
+                const int rc = TcpDo(-ErrNoMem, [&](net::TcpStack &t) {
+                    return g_tcpsocks.connectVirtual(t, pid, sockfd, ip, port); });
+                if (rc < 0) { ret.SetValue(-1); err.SetValue(-rc); R_SUCCEED(); }
+                if (ts.nonblock) { ret.SetValue(-1); err.SetValue(ErrInProgress); R_SUCCEED(); }
+                const u64 deadline = TcpNowMs() + 30000;
+                for (;;) {
+                    const int st = TcpDo(ErrBadF, [&](net::TcpStack &t) { return g_tcpsocks.connectStatus(t, pid, sockfd); });
+                    if (st == 0) { ret.SetValue(0); err.SetValue(0); Note("ZT tcp connect  fd %d", sockfd); R_SUCCEED(); }
+                    if (st != ErrInProgress) { ret.SetValue(-1); err.SetValue(st); R_SUCCEED(); }
+                    if (TcpNowMs() > deadline) { ret.SetValue(-1); err.SetValue(ErrTimedOut); R_SUCCEED(); }
+                    TcpSleep();
+                }
+            }
+        }
         if (addr.GetSize() >= 2 && GetLanVfd(m_client_info.process_id.value, sockfd) != net::InvalidSocket) {
             const u8 *p = static_cast<const u8 *>(addr.GetPointer());
             if (p[1] == 0) { /* AF_UNSPEC disconnect */
@@ -1946,6 +2161,12 @@ namespace ztnx::mitm {
 
     Result BsdShim::Send(ams::sf::Out<s32> ret, ams::sf::Out<s32> err, s32 sockfd, u32 flags,
                          const ams::sf::InAutoSelectBuffer &buf) {
+        {
+            s32 r = 0, e = 0;
+            if (TcpVirtualSend(m_client_info.process_id.value, sockfd, buf.GetPointer(), buf.GetSize(), flags, &r, &e)) {
+                ret.SetValue(r); err.SetValue(e); R_SUCCEED();
+            }
+        }
         const bool mirrored = MirrorConnectedLanDatagram(m_client_info.process_id.value, sockfd,
                                                          buf.GetPointer(), buf.GetSize(), "send");
         if (mirrored) {
@@ -1968,6 +2189,12 @@ namespace ztnx::mitm {
 
     Result BsdShim::Write(ams::sf::Out<s32> ret, ams::sf::Out<s32> err, s32 fd,
                           const ams::sf::InAutoSelectBuffer &buf) {
+        {
+            s32 r = 0, e = 0;
+            if (TcpVirtualSend(m_client_info.process_id.value, fd, buf.GetPointer(), buf.GetSize(), 0, &r, &e)) {
+                ret.SetValue(r); err.SetValue(e); R_SUCCEED();
+            }
+        }
         const bool mirrored = MirrorConnectedLanDatagram(m_client_info.process_id.value, fd,
                                                          buf.GetPointer(), buf.GetSize(), "write");
         if (mirrored) {
@@ -2010,6 +2237,12 @@ namespace ztnx::mitm {
     Result BsdShim::Recv(ams::sf::Out<s32> ret, ams::sf::Out<s32> err, s32 sockfd, u32 flags,
                          const ams::sf::OutAutoSelectBuffer &buf) {
         constexpr u32 MsgPeek = 0x2;
+        {
+            s32 r = 0, e = 0;
+            if (TcpVirtualRecv(m_client_info.process_id.value, sockfd, buf.GetPointer(), buf.GetSize(), flags, &r, &e)) {
+                ret.SetValue(r); err.SetValue(e); R_SUCCEED();
+            }
+        }
         u32 src_ip = 0;
         u16 src_port = 0;
         const int n = ReceiveLanDatagram(m_client_info.process_id.value, sockfd,
@@ -2034,6 +2267,12 @@ namespace ztnx::mitm {
 
     Result BsdShim::Read(ams::sf::Out<s32> ret, ams::sf::Out<s32> err, s32 fd,
                          const ams::sf::OutAutoSelectBuffer &buf) {
+        {
+            s32 r = 0, e = 0;
+            if (TcpVirtualRecv(m_client_info.process_id.value, fd, buf.GetPointer(), buf.GetSize(), 0, &r, &e)) {
+                ret.SetValue(r); err.SetValue(e); R_SUCCEED();
+            }
+        }
         u32 src_ip = 0;
         u16 src_port = 0;
         const int n = ReceiveLanDatagram(m_client_info.process_id.value, fd,
@@ -2099,6 +2338,47 @@ namespace ztnx::mitm {
     Result BsdShim::Accept(ams::sf::Out<s32> ret, ams::sf::Out<s32> err,
                            ams::sf::Out<u32> addrlen, s32 sockfd,
                            const ams::sf::OutAutoSelectBuffer &addr) {
+        const u64 pid = m_client_info.process_id.value;
+        const TcpSockets::Info ts = TcpGetInfo(pid, sockfd);
+        if (ts.kind == TcpSockets::Kind::Listener) {
+            for (;;) {
+                if (TcpDo(0, [&](net::TcpStack &t) { return g_tcpsocks.pending(t, pid, sockfd); }) > 0) {
+                    /* fd marcador real: reserva un número de fd válido para la app. */
+                    const struct { s32 d, t, p; } sin = { 2, 1, 0 };
+                    BsdResult sock;
+                    R_TRY(serviceMitmDispatchInOut(m_forward_service.get(), 2, sin, sock, ZTNX_PID));
+                    if (sock.ret < 0) { ret.SetValue(-1); err.SetValue(sock.err); addrlen.SetValue(0); R_SUCCEED(); }
+                    u32 pip = 0;
+                    u16 pport = 0;
+                    const bool ok = TcpDo(false, [&](net::TcpStack &t) {
+                        return g_tcpsocks.acceptInto(t, pid, sockfd, sock.ret) &&
+                               g_tcpsocks.localPeer(t, pid, sock.ret, &pip, &pport); });
+                    if (!ok) {
+                        BsdResult cl;
+                        R_TRY(serviceMitmDispatchInOut(m_forward_service.get(), 26, sock.ret, cl, ZTNX_PID));
+                        continue;
+                    }
+                    if (addr.GetSize() >= 16) {
+                        WriteSockAddr(static_cast<u8 *>(addr.GetPointer()), pip, pport);
+                        addrlen.SetValue(16);
+                    } else {
+                        addrlen.SetValue(0);
+                    }
+                    ret.SetValue(sock.ret);
+                    err.SetValue(0);
+                    Note("ZT tcp accept   fd %d -> %d from %u.%u.%u.%u:%u", sockfd, sock.ret,
+                         (unsigned)(pip >> 24), (unsigned)(pip >> 16) & 0xff,
+                         (unsigned)(pip >> 8) & 0xff, (unsigned)pip & 0xff, pport);
+                    R_SUCCEED();
+                }
+                if (RealReadable(m_forward_service.get(), pid, sockfd)) { break; }
+                if (ts.nonblock) { ret.SetValue(-1); err.SetValue(ErrAgain); addrlen.SetValue(0); R_SUCCEED(); }
+                if (TcpGetInfo(pid, sockfd).kind != TcpSockets::Kind::Listener) {
+                    ret.SetValue(-1); err.SetValue(ErrBadF); addrlen.SetValue(0); R_SUCCEED();
+                }
+                TcpSleep();
+            }
+        }
         struct { BsdResult r; u32 addrlen; } out;
         R_TRY(serviceMitmDispatchInOut(m_forward_service.get(), 12, sockfd, out,
                                        ZTNX_OUT_BUF(addr), ZTNX_PID));
@@ -2110,6 +2390,20 @@ namespace ztnx::mitm {
     Result BsdShim::GetPeerName(ams::sf::Out<s32> ret, ams::sf::Out<s32> err,
                                 ams::sf::Out<u32> addrlen, s32 sockfd,
                                 const ams::sf::OutAutoSelectBuffer &addr) {
+        {
+            u32 pip = 0;
+            u16 pport = 0;
+            const u64 pid = m_client_info.process_id.value;
+            if (TcpDo(false, [&](net::TcpStack &t) { return g_tcpsocks.localPeer(t, pid, sockfd, &pip, &pport); })) {
+                if (addr.GetSize() >= 16) {
+                    WriteSockAddr(static_cast<u8 *>(addr.GetPointer()), pip, pport);
+                    ret.SetValue(0); err.SetValue(0); addrlen.SetValue(16);
+                } else {
+                    ret.SetValue(-1); err.SetValue(ErrInval); addrlen.SetValue(0);
+                }
+                R_SUCCEED();
+            }
+        }
         s32 vfd = net::InvalidSocket;
         u32 ip = 0;
         u16 port = 0;
@@ -2148,6 +2442,19 @@ namespace ztnx::mitm {
     Result BsdShim::GetSockName(ams::sf::Out<s32> ret, ams::sf::Out<s32> err,
                                 ams::sf::Out<u32> addrlen, s32 sockfd,
                                 const ams::sf::OutAutoSelectBuffer &addr) {
+        {
+            u32 pip = 0, zt_ip = 0;
+            u16 pport = 0;
+            const u64 pid = m_client_info.process_id.value;
+            if (g_port != nullptr && addr.GetSize() >= 16 && g_port->GetLanIpConfig(std::addressof(zt_ip), nullptr) &&
+                TcpDo(false, [&](net::TcpStack &t) { return g_tcpsocks.localPeer(t, pid, sockfd, &pip, &pport); })) {
+                const u16 lport = TcpDo(static_cast<u16>(0), [&](net::TcpStack &t) {
+                    return g_tcpsocks.localPort(t, pid, sockfd); });
+                WriteSockAddr(static_cast<u8 *>(addr.GetPointer()), zt_ip, lport);
+                ret.SetValue(0); err.SetValue(0); addrlen.SetValue(16);
+                R_SUCCEED();
+            }
+        }
         struct { BsdResult r; u32 addrlen; } out;
         R_TRY(serviceMitmDispatchInOut(m_forward_service.get(), 16, sockfd, out,
                                        ZTNX_OUT_BUF(addr), ZTNX_PID));
@@ -2195,6 +2502,18 @@ namespace ztnx::mitm {
                                        ZTNX_OUT_BUF(optval), ZTNX_PID));
         ZTNX_RET(out.r);
         optlen.SetValue(out.optlen);
+        const bool so_error = (level == 0xFFFF && optname == 0x1007) || (level == 1 && optname == 4);
+        if (so_error && optval.GetSize() >= 4) {
+            const u64 pid = m_client_info.process_id.value;
+            if (TcpGetInfo(pid, sockfd).kind == TcpSockets::Kind::Conn) {
+                int st = TcpDo(ErrBadF, [&](net::TcpStack &t) { return g_tcpsocks.connectStatus(t, pid, sockfd); });
+                if (st == ErrInProgress) { st = 0; }
+                const s32 v = st;
+                std::memcpy(optval.GetPointer(), std::addressof(v), sizeof(v));
+                optlen.SetValue(4);
+                ret.SetValue(0); err.SetValue(0);
+            }
+        }
         R_SUCCEED();
     }
 
@@ -2209,6 +2528,22 @@ namespace ztnx::mitm {
          * behavior, and every error code the game already expects. MSG_PEEK
          * returns the virtual head without consuming it, matching BSD. */
         constexpr u32 MsgPeek = 0x2;
+        {
+            s32 r = 0, e = 0;
+            if (TcpVirtualRecv(m_client_info.process_id.value, sockfd, buf.GetPointer(), buf.GetSize(), flags, &r, &e)) {
+                u32 pip = 0;
+                u16 pport = 0;
+                const u64 pid = m_client_info.process_id.value;
+                if (r >= 0 && addr.GetSize() >= 16 &&
+                    TcpDo(false, [&](net::TcpStack &t) { return g_tcpsocks.localPeer(t, pid, sockfd, &pip, &pport); })) {
+                    WriteSockAddr(static_cast<u8 *>(addr.GetPointer()), pip, pport);
+                    addrlen.SetValue(16);
+                } else {
+                    addrlen.SetValue(0);
+                }
+                ret.SetValue(r); err.SetValue(e); R_SUCCEED();
+            }
+        }
         u32 src_ip = 0;
         u16 src_port = 0;
         const int n = ReceiveLanDatagram(m_client_info.process_id.value, sockfd,
@@ -2273,6 +2608,88 @@ namespace ztnx::mitm {
          * is present, then merge both readiness sets. This closes the race in
          * which a ZT packet arrived immediately after our pre-check and stayed
          * invisible inside a long/infinite physical select. */
+        {
+            /* TCP virtual (lwIP): mismo esquema que Poll, con bitsets. */
+            constexpr size_t MaxSetBytes = 128;
+            const u64 pid = m_client_info.process_id.value;
+            const size_t rdn = rd.GetSize(), wrn = wr.GetSize(), exn = ex.GetSize();
+            bool watches_tcp = false;
+            if (nfds > 0 && rdn <= MaxSetBytes && wrn <= MaxSetBytes && exn <= MaxSetBytes &&
+                ord.GetSize() <= MaxSetBytes && owr.GetSize() <= MaxSetBytes && oex.GetSize() <= MaxSetBytes) {
+                for (s32 fd = 0; fd < nfds && !watches_tcp; ++fd) {
+                    if ((FdIsSet(fd, rd.GetPointer(), rdn) || FdIsSet(fd, wr.GetPointer(), wrn)) &&
+                        TcpDo(false, [&](net::TcpStack &) { return g_tcpsocks.virtualFd(pid, fd); })) {
+                        watches_tcp = true;
+                    }
+                }
+            }
+            if (watches_tcp) {
+                const u64 deadline = timeout.is_null ? ~0ull :
+                    TcpNowMs() + static_cast<u64>(timeout.value.seconds) * 1000 +
+                    static_cast<u64>(timeout.value.microseconds) / 1000;
+                for (;;) {
+                    u8 rdc[MaxSetBytes] = {}, wrc[MaxSetBytes] = {}, exc[MaxSetBytes] = {};
+                    u8 vrd[MaxSetBytes] = {}, vwr[MaxSetBytes] = {};
+                    u8 ordo[MaxSetBytes] = {}, owro[MaxSetBytes] = {}, oexo[MaxSetBytes] = {};
+                    std::memcpy(rdc, rd.GetPointer(), rdn);
+                    std::memcpy(wrc, wr.GetPointer(), wrn);
+                    std::memcpy(exc, ex.GetPointer(), exn);
+                    int vready = 0;
+                    for (s32 fd = 0; fd < nfds; ++fd) {
+                        const bool want_r = FdIsSet(fd, rd.GetPointer(), rdn);
+                        const bool want_w = FdIsSet(fd, wr.GetPointer(), wrn);
+                        if (!want_r && !want_w) { continue; }
+                        const TcpSockets::Info info = TcpGetInfo(pid, fd);
+                        if (info.kind == TcpSockets::Kind::Listener || info.kind == TcpSockets::Kind::Conn) {
+                            const short ev = static_cast<short>((want_r ? PollIn : 0) | (want_w ? PollOut : 0));
+                            const short rev = TcpDo(static_cast<short>(0), [&](net::TcpStack &t) {
+                                return g_tcpsocks.pollEvents(t, pid, fd, ev); });
+                            const bool bad = (rev & (PollErr | PollHup)) != 0;
+                            if (want_r && ((rev & PollIn) || bad)) { FdSet(fd, vrd, MaxSetBytes); ++vready; }
+                            if (want_w && ((rev & PollOut) || bad)) { FdSet(fd, vwr, MaxSetBytes); ++vready; }
+                            if (info.kind == TcpSockets::Kind::Conn) {
+                                rdc[fd / 8] = static_cast<u8>(rdc[fd / 8] & ~(1u << (fd % 8)));
+                                wrc[fd / 8] = static_cast<u8>(wrc[fd / 8] & ~(1u << (fd % 8)));
+                            }
+                        } else if (want_r && LanSocketReadable(pid, fd)) {
+                            FdSet(fd, vrd, MaxSetBytes);
+                            ++vready;
+                        }
+                    }
+                    const u64 now = TcpNowMs();
+                    const u64 remaining = deadline == ~0ull ? 10 : (deadline > now ? deadline - now : 0);
+                    BsdSelectTimeval wait = {};
+                    wait.is_null = false;
+                    wait.value.seconds = 0;
+                    wait.value.microseconds = vready > 0 ? 0 : static_cast<decltype(wait.value.microseconds)>((remaining < 10 ? remaining : 10) * 1000);
+                    const struct { s32 nfds; u32 pad; BsdSelectTimeval timeout; } in = { nfds, 0, wait };
+                    BsdResult out;
+                    R_TRY(serviceMitmDispatchInOut(m_forward_service.get(), 5, in, out,
+                               .buffer_attrs = { SfBufferAttr_HipcAutoSelect | SfBufferAttr_In,
+                                                 SfBufferAttr_HipcAutoSelect | SfBufferAttr_In,
+                                                 SfBufferAttr_HipcAutoSelect | SfBufferAttr_In,
+                                                 SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out,
+                                                 SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out,
+                                                 SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out },
+                               .buffers      = { { rdc, rdn }, { wrc, wrn }, { exc, exn },
+                                                 { ordo, ord.GetSize() }, { owro, owr.GetSize() }, { oexo, oex.GetSize() } },
+                               ZTNX_PID));
+                    if (out.ret < 0) { ZTNX_RET(out); R_SUCCEED(); }
+                    int ready = 0;
+                    for (size_t i = 0; i < ord.GetSize(); ++i) { ordo[i] = static_cast<u8>(ordo[i] | vrd[i]); ready += __builtin_popcount(ordo[i]); }
+                    for (size_t i = 0; i < owr.GetSize(); ++i) { owro[i] = static_cast<u8>(owro[i] | vwr[i]); ready += __builtin_popcount(owro[i]); }
+                    for (size_t i = 0; i < oex.GetSize(); ++i) { ready += __builtin_popcount(oexo[i]); }
+                    if (ready > 0 || TcpNowMs() >= deadline) {
+                        std::memcpy(ord.GetPointer(), ordo, ord.GetSize());
+                        std::memcpy(owr.GetPointer(), owro, owr.GetSize());
+                        std::memcpy(oex.GetPointer(), oexo, oex.GetSize());
+                        ret.SetValue(ready);
+                        err.SetValue(0);
+                        R_SUCCEED();
+                    }
+                }
+            }
+        }
         bool watches_vnet = false;
         bool vnet_ready_now = false;
         for (s32 fd = 0; fd < nfds; ++fd) {
@@ -2334,6 +2751,75 @@ namespace ztnx::mitm {
         static_assert(sizeof(PollFd) == 8);
         constexpr s16 PollIn = 0x0001;
         const size_t count = nfds > 0 ? std::min((size_t)nfds, out_fds.GetSize() / sizeof(PollFd)) : 0;
+        {
+            /* TCP virtual (lwIP): un solo poll real no puede esperar a la vez por
+             * fds de bsd y por lwIP. Se sondean ambos en rodajas de <=10 ms hasta
+             * que algo esté listo o venza el plazo. */
+            constexpr size_t MaxPollFds = 64;
+            const u64 pid = m_client_info.process_id.value;
+            bool watches_tcp = false;
+            if (count > 0 && count <= MaxPollFds && in_fds.GetSize() >= count * sizeof(PollFd)) {
+                for (size_t i = 0; i < count && !watches_tcp; ++i) {
+                    PollFd p{};
+                    std::memcpy(std::addressof(p), static_cast<const u8 *>(in_fds.GetPointer()) + i * sizeof(p), sizeof(p));
+                    watches_tcp = TcpDo(false, [&](net::TcpStack &) { return g_tcpsocks.virtualFd(pid, p.fd); });
+                }
+            }
+            if (watches_tcp) {
+                const u64 deadline = timeout < 0 ? ~0ull : TcpNowMs() + static_cast<u64>(timeout);
+                PollFd inb[MaxPollFds], rin[MaxPollFds], rout[MaxPollFds];
+                s16 vrev[MaxPollFds];
+                bool isconn[MaxPollFds];
+                for (size_t i = 0; i < count; ++i) {
+                    std::memcpy(std::addressof(inb[i]), static_cast<const u8 *>(in_fds.GetPointer()) + i * sizeof(PollFd), sizeof(PollFd));
+                }
+                for (;;) {
+                    int vready = 0;
+                    for (size_t i = 0; i < count; ++i) {
+                        const TcpSockets::Info info = TcpGetInfo(pid, inb[i].fd);
+                        isconn[i] = info.kind == TcpSockets::Kind::Conn;
+                        vrev[i] = 0;
+                        if (info.kind == TcpSockets::Kind::Listener || isconn[i]) {
+                            vrev[i] = TcpDo(static_cast<short>(0), [&](net::TcpStack &t) {
+                                return g_tcpsocks.pollEvents(t, pid, inb[i].fd, inb[i].events); });
+                        } else if ((inb[i].events & PollIn) && LanSocketReadable(pid, inb[i].fd)) {
+                            vrev[i] = PollIn;
+                        }
+                        if (vrev[i] != 0) { ++vready; }
+                        rin[i] = inb[i];
+                        rin[i].revents = 0;
+                        if (isconn[i]) { rin[i].fd = -1; }
+                    }
+                    const u64 now = TcpNowMs();
+                    const u64 remaining = deadline == ~0ull ? 10 : (deadline > now ? deadline - now : 0);
+                    const s32 slice = vready > 0 ? 0 : static_cast<s32>(remaining < 10 ? remaining : 10);
+                    const struct { s32 nfds, timeout; } in = { static_cast<s32>(count), slice };
+                    BsdResult out;
+                    R_TRY(serviceMitmDispatchInOut(m_forward_service.get(), 6, in, out,
+                               .buffer_attrs = { SfBufferAttr_HipcAutoSelect | SfBufferAttr_In,
+                                                 SfBufferAttr_HipcAutoSelect | SfBufferAttr_Out },
+                               .buffers      = { { rin,  count * sizeof(PollFd) },
+                                                 { rout, count * sizeof(PollFd) } },
+                               ZTNX_PID));
+                    if (out.ret < 0) { ZTNX_RET(out); R_SUCCEED(); }
+                    s32 ready = 0;
+                    for (size_t i = 0; i < count; ++i) {
+                        s16 rev = isconn[i] ? 0 : rout[i].revents;
+                        rev = static_cast<s16>(rev | vrev[i]);
+                        rout[i].fd = inb[i].fd;
+                        rout[i].events = inb[i].events;
+                        rout[i].revents = rev;
+                        if (rev != 0) { ++ready; }
+                    }
+                    if (ready > 0 || TcpNowMs() >= deadline) {
+                        std::memcpy(out_fds.GetPointer(), rout, count * sizeof(PollFd));
+                        ret.SetValue(ready);
+                        err.SetValue(0);
+                        R_SUCCEED();
+                    }
+                }
+            }
+        }
         bool watches_vnet = false;
         bool vnet_ready_now = false;
         if (out_fds.GetSize() >= in_fds.GetSize()) {
@@ -2416,6 +2902,12 @@ namespace ztnx::mitm {
         /* SIOCGIFCONF / SIOCGIFADDR would mean the game asks the interface
          * directly instead of learning peers from recvfrom -- section 4 calls
          * that out as the case that would need extra work. */
+        if (out.ret >= 0 && (static_cast<u32>(request) == 0x8004667Eu || request == 0x5421) && b1.GetSize() >= 4) {
+            s32 on = 0;
+            std::memcpy(std::addressof(on), b1.GetPointer(), sizeof(on));
+            const u64 pid = m_client_info.process_id.value;
+            TcpDo(0, [&](net::TcpStack &) { g_tcpsocks.setNonblock(pid, fd, on != 0); return 0; });
+        }
         Note("Ioctl           fd %d request %08x", fd, request);
         R_SUCCEED();
     }

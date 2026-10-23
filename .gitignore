@@ -36,3 +36,11 @@ build.log
 # Optional game ExeFS experiments
 /exefs/
 /exefs.nsp
+
+/dist/
+tests/test_perf_base
+tests/test_perf_new
+tests/test_policy
+tests/test_tcp
+tests/*.dSYM/
+build-fw23.log

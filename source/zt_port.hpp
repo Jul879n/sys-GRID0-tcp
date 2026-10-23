@@ -18,6 +18,7 @@
 #include <ZeroTierOne.h>
 
 #include "net/vnet.hpp"
+#include "net/tcp_stack.hpp"
 
 namespace ztnx {
 
@@ -80,6 +81,14 @@ namespace ztnx {
                                 u32 *src_ip, u16 *src_port, bool peek = false);
         void CloseLanSocket(int vfd);
 
+        /* TCP (lwIP) sobre la red virtual. Toda llamada toma m_vnetLock, el mismo
+         * que serializa VNet, porque lwIP (NO_SYS) no es thread-safe. */
+        template <typename F>
+        auto WithTcp(F &&f) {
+            std::scoped_lock lk(m_vnetLock);
+            return f(*net::TcpStack::instance());
+        }
+
         /* Snapshot of the ZeroTier IPv4 identity, in host order. */
         bool GetLanIpConfig(u32 *ip, u32 *netmask);
 
@@ -130,6 +139,7 @@ namespace ztnx {
         void writePeers();
         void probePeer();
         void maintainWireSocket();
+        void ResetTcpLocked();
 
         int64_t m_lastBeatMs = 0;
         int64_t m_lastNetworkPollMs = 0;
@@ -276,6 +286,8 @@ namespace ztnx {
     bool ConfigFlag(const char *key, bool dflt);
     int  ConfigValue(const char *key, int dflt);
     uint32_t ConfigIpv4(const char *key);   /* 0 when absent or unparseable */
+    /* Valor textual de `key = ...` (sin espacios de los extremos); false si falta. */
+    bool ConfigString(const char *key, char *out, size_t cap);
 
     /* The packet/MITM traces are intentionally opt-in in release builds. They
      * are invaluable for a bug report, but formatting and rewriting them on

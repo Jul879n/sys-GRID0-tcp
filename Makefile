@@ -171,6 +171,11 @@ ZT_LIBDIR   := $(SZT_DIR)build-ztcore
 SOURCES     += source/net source/mitm
 INCLUDES    += source
 CXXFLAGS    += -I$(ZT_ROOT) -I$(ZT_ROOT)/include
+# lwIP (TCP sobre la red virtual): se compila como una sola unidad C
+# (source/net/lwip_unity.c) y se configura con lib/lwip-port/lwipopts.h.
+LWIP_INC    := -I$(SZT_DIR)lib/lwip/src/include -I$(SZT_DIR)lib/lwip-port
+CFLAGS      += $(LWIP_INC)
+CXXFLAGS    += $(LWIP_INC)
 LIBS        += -L$(ZT_LIBDIR) -lztcore
 # libztcore is a static archive and itself depends on libstratosphere/libnx.
 # Repeat those archives after it so the one-pass static linker can satisfy the

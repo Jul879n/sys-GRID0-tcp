@@ -559,6 +559,13 @@ namespace ztnx {
             "debug_logging = 0\n"
             "# Try finite UPnP/NAT-PMP UDP mappings on the physical router.\n"
             "port_mapping = 1\n"
+            "# Homebrew/aplicaciones fuera de la lista de juegos LAN que usan TCP por la\n"
+            "# VPN (p. ej. un servidor FTP). Requiere reiniciar. `extra_titles` lista\n"
+            "# program ids (16 hex, separados por coma o espacio); los applets (Album,\n"
+            "# etc.) solo se interceptan si estan aqui. `mitm_homebrew = 1` intercepta\n"
+            "# toda aplicacion (title takeover). Los modulos de sistema nunca.\n"
+            "# extra_titles =\n"
+            "mitm_homebrew = 0\n"
             "\n"
             "# Bring-up announcement. The console broadcasts an ICMP echo to the\n"
             "# subnet broadcast address every 5 seconds, so every other member\n"
@@ -905,6 +912,45 @@ namespace ztnx {
         return result;
     }
 
+    bool ConfigString(const char *key, char *out, size_t cap)
+    {
+        if (cap == 0) { return false; }
+        out[0] = '\0';
+        char buf[ConfigFileCapacity];
+        size_t len = 0;
+        if (!ReadWholeFile(ConfigPath, buf, sizeof(buf), std::addressof(len))) { return false; }
+
+        const size_t klen = std::strlen(key);
+        bool found = false;
+        const char *line = buf;
+        while (*line) {
+            const char *eol = line;
+            while (*eol && *eol != '\n') { ++eol; }
+
+            const char *p = line;
+            while (p < eol && (*p == ' ' || *p == '\t')) { ++p; }
+
+            if (p < eol && *p != '#' && *p != ';' &&
+                (size_t)(eol - p) >= klen && std::strncmp(p, key, klen) == 0) {
+                const char *q = p + klen;
+                while (q < eol && (*q == ' ' || *q == '\t')) { ++q; }
+                if (q < eol && *q == '=') {
+                    ++q;
+                    while (q < eol && (*q == ' ' || *q == '\t')) { ++q; }
+                    const char *e = eol;
+                    while (e > q && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r')) { --e; }
+                    size_t n = (size_t)(e - q);
+                    if (n >= cap) { n = cap - 1; }
+                    std::memcpy(out, q, n);
+                    out[n] = '\0';
+                    found = true;
+                }
+            }
+            line = (*eol == '\n') ? (eol + 1) : eol;
+        }
+        return found;
+    }
+
     bool ConfigFlag(const char *key, bool dflt)
     {
         char buf[ConfigFileCapacity];
@@ -1061,6 +1107,27 @@ namespace ztnx {
         return -1;
     }
 
+    static bool TcpSendIpThunk(void *ctx, u32 dst, u8 proto, const u8 *p, unsigned int len)
+    {
+        static_cast<net::VNet *>(ctx)->sendIp(dst, proto, p, len);
+        return true;
+    }
+
+    static void TcpInputThunk(void *ctx, u32 src, u32 dst, const u8 *seg, unsigned int len)
+    {
+        static_cast<net::TcpStack *>(ctx)->input(src, dst, seg, len);
+    }
+
+    static u32 TcpNow() { return static_cast<u32>(NowMs()); }
+
+    /* Con m_vnetLock tomado (o antes de que haya otros hilos). */
+    void Port::ResetTcpLocked()
+    {
+        net::TcpStack *tcp = net::TcpStack::instance();
+        tcp->init(&TcpSendIpThunk, &m_vnet, &TcpNow);
+        m_vnet.setTcpInput(&TcpInputThunk, tcp);
+    }
+
     void Port::cbVirtualFrame(ZT_Node *, void *uptr, void *, uint64_t nwid, void **,
                               uint64_t srcMac, uint64_t destMac, unsigned int etherType,
                               unsigned int, const void *data, unsigned int len)
@@ -1163,6 +1230,7 @@ namespace ztnx {
             std::scoped_lock lk(self->m_vnetLock);
             self->m_vnet.reset();
             self->m_vnet.setEmit(&Port::cbEmit, self);
+            self->ResetTcpLocked();
             return 0;
         }
 
@@ -1197,6 +1265,7 @@ namespace ztnx {
             {
                 std::scoped_lock lk(self->m_vnetLock);
                 self->m_vnet.configure(conf->mac, ip, netmask, (uint16_t)conf->mtu);
+                net::TcpStack::instance()->setAddress(ip, netmask);
             }
             break;
         }
@@ -1264,6 +1333,7 @@ namespace ztnx {
         m_nwid = nwid;
         m_vnet.reset();
         m_vnet.setEmit(&Port::cbEmit, this);
+        ResetTcpLocked();
 
         Trace("port: opening UDP/%u", (unsigned)DefaultWirePort);
         if (!this->openWireSocket()) { return false; }
@@ -1327,6 +1397,12 @@ namespace ztnx {
          * memory. Ignoring it left the module spinning forever with no way to
          * tell that it never joined anything. */
         Trace("port: node created, joining %.16llx", (unsigned long long)nwid);
+        // Medición para atribuir la memoria del arena entre arranques (original vs fork).
+        if (auto *allocator = ams::init::GetAllocator(); allocator != nullptr) {
+            Trace("port: arena after node: %u KB free, %u KB largest",
+                  (unsigned)(allocator->GetTotalFreeSize() / 1024),
+                  (unsigned)(allocator->GetAllocatableSize() / 1024));
+        }
         const ZT_ResultCode jrc = ZT_Node_join(m_node, nwid, nullptr, nullptr);
         if (jrc != ZT_RESULT_OK) {
             m_lastError = (int)jrc;
@@ -1982,7 +2058,11 @@ namespace ztnx {
             if (m_wireFd < 0) { os::SleepThread(TimeSpan::FromMilliSeconds(10)); }
 
             struct pollfd pfd = { .fd = m_wireFd, .events = POLLIN, .revents = 0 };
-            const int pr = (m_wireFd >= 0) ? ::poll(&pfd, 1, 10) : 0;
+            /* Con conexiones TCP vivas el hilo de la app deja segmentos en la cola de salida y
+             * solo este bucle los entrega a ZeroTier: poll() de 10 ms sumaba hasta 10 ms por
+             * ida y vuelta (ventana/RTT). Con TCP activo se despierta cada 2 ms; sin TCP, igual que antes. */
+            const int pollMs = WithTcp([](net::TcpStack &t) { return t.connsInUse() > 0 ? 2 : 10; });
+            const int pr = (m_wireFd >= 0) ? ::poll(&pfd, 1, pollMs) : 0;
 
             if (pr < 0) {
                 /* An erroring poll returns instantly, so without this the loop
@@ -2039,6 +2119,7 @@ namespace ztnx {
             TraceArenaWatermark();
 
             /* 4. timers */
+            WithTcp([](net::TcpStack &t) { t.poll(); return 0; });
             const int64_t now = NowMs();
             if (m_wireFd >= 0 && now >= m_nextDeadline) {
                 volatile int64_t deadline = 0;

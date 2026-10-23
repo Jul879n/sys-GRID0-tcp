@@ -239,6 +239,10 @@ namespace ztnx::net {
         switch (proto) {
             case IpProto_UDP:  onUdp(srcIp, dstIp, payload, len); break;
             case IpProto_ICMP: onIcmp(srcIp, payload, len);       break;
+            case IpProto_TCP:
+                m_stats.rxTcp++;
+                if (m_tcpFn != nullptr && dstIp == m_ip) { m_tcpFn(m_tcpCtx, srcIp, dstIp, payload, len); }
+                break;
             default: break;
         }
     }
@@ -476,6 +480,12 @@ namespace ztnx::net {
         sendIpv4(dstIp, IpProto_UDP, datagram, udpLen);
         m_stats.txUdp++;
         return (int)len;
+    }
+
+    void VNet::sendIp(u32 dstIp, u8 proto, const u8 *payload, unsigned int len)
+    {
+        if (proto == IpProto_TCP) { m_stats.txTcp++; }
+        sendIpv4(dstIp, proto, payload, len);
     }
 
     void VNet::sendIpv4(u32 dstIp, u8 proto, const u8 *payload, unsigned int len)
